@@ -195,6 +195,105 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
 )
 
 
+SGLANG_SCORE_METRICS_LOGGING = get_bool_env_var("SGLANG_SCORE_METRICS_LOGGING")
+SGLANG_SCORE_METRICS_WARMUP_RID_PREFIX = "METACAMP_WARMUP_"
+
+
+@dataclasses.dataclass
+class ScoreMetricsLogger:
+    """Log the benchmark score formula as requests finish.
+
+    This deliberately lives in TokenizerManager: it owns the request-received,
+    first-token, and finished timestamps, so the measurements include
+    tokenization/dispatch and scheduler queueing.  It does not alter responses
+    or Prometheus metrics.
+    """
+
+    completed_requests: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_ttft_s: float = 0.0
+    total_decode_s: float = 0.0
+
+    def log_finished(
+        self,
+        *,
+        rid: str,
+        finish_reason: Any,
+        prompt_tokens: int,
+        completion_tokens: int,
+        time_stats: APIServerReqTimeStats,
+        scheduler_time_stats: Any,
+    ) -> None:
+        reason_type = (
+            finish_reason.get("type") if isinstance(finish_reason, dict) else None
+        )
+        ttft_s = max(0.0, time_stats.get_first_token_latency())
+        decode_s = max(0.0, time_stats.get_decode_latency())
+        e2e_s = max(0.0, time_stats.get_e2e_latency())
+        scheduler_queue_s = None
+        if scheduler_time_stats is not None:
+            queue_start = getattr(scheduler_time_stats, "wait_queue_entry_time", 0.0)
+            queue_end = getattr(scheduler_time_stats, "forward_entry_time", 0.0)
+            if queue_start > 0.0 and queue_end >= queue_start:
+                scheduler_queue_s = queue_end - queue_start
+
+        # Aborted requests, SGLang health checks, and explicitly tagged warmup
+        # requests are not valid scored completions. Still log them so an
+        # interrupted or warming-up run remains visible for diagnostics.
+        excluded = rid.startswith(HEALTH_CHECK_RID_PREFIX) or rid.startswith(
+            SGLANG_SCORE_METRICS_WARMUP_RID_PREFIX
+        )
+        included = reason_type != "abort" and not excluded
+        if included:
+            self.completed_requests += 1
+            self.input_tokens += prompt_tokens
+            self.output_tokens += completion_tokens
+            self.total_ttft_s += ttft_s
+            self.total_decode_s += decode_s
+
+        record = {
+            "event": "score_metrics",
+            "rid": rid,
+            "included": included,
+            "finish_reason": reason_type,
+            "request": {
+                "input_tokens": prompt_tokens,
+                "output_tokens": completion_tokens,
+                "ttft_ms": round(ttft_s * 1000, 3),
+                "decode_ms": round(decode_s * 1000, 3),
+                "e2e_ms": round(e2e_s * 1000, 3),
+                "scheduler_queue_ms": (
+                    round(scheduler_queue_s * 1000, 3)
+                    if scheduler_queue_s is not None
+                    else None
+                ),
+                "input_tps": round(prompt_tokens / ttft_s, 3) if ttft_s else None,
+                "output_tps": (
+                    round(completion_tokens / decode_s, 3) if decode_s else None
+                ),
+            },
+            "completed": {
+                "requests": self.completed_requests,
+                "input_tokens": self.input_tokens,
+                "output_tokens": self.output_tokens,
+                "ttft_s": round(self.total_ttft_s, 6),
+                "decode_s": round(self.total_decode_s, 6),
+                "input_tps": (
+                    round(self.input_tokens / self.total_ttft_s, 3)
+                    if self.total_ttft_s
+                    else None
+                ),
+                "output_tps": (
+                    round(self.output_tokens / self.total_decode_s, 3)
+                    if self.total_decode_s
+                    else None
+                ),
+            },
+        }
+        logger.info("SGLANG_SCORE_METRICS %s", json.dumps(record, separators=(",", ":")))
+
+
 class RequestAbortedError(ValueError):
     status_code = 499
 
@@ -552,6 +651,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
+        self.score_metrics_logger = (
+            ScoreMetricsLogger() if SGLANG_SCORE_METRICS_LOGGING else None
+        )
         # Parallel sampling keeps one caller-visible logical RID per original
         # prompt while the scheduler operates on separate prefix/sample RIDs.
         self.logical_rid_to_child_rids: Dict[str, set[str]] = {}
@@ -2434,21 +2536,35 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 if self.server_args.speculative_algorithm:
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
+                completion_tokens = (
+                    recv_obj.completion_tokens[i]
+                    if not isinstance(recv_obj, BatchEmbeddingOutput)
+                    else 0
+                )
                 if self.enable_metrics:
                     scheduler_time_stats = (
                         recv_obj.time_stats[i]
                         if recv_obj.time_stats is not None
                         else None
                     )
-                    completion_tokens = (
-                        recv_obj.completion_tokens[i]
-                        if not isinstance(recv_obj, BatchEmbeddingOutput)
-                        else 0
-                    )
                     meta_info.update(
                         state.time_stats.convert_to_output_meta_info(
                             scheduler_time_stats, completion_tokens
                         )
+                    )
+
+                if self.score_metrics_logger is not None:
+                    self.score_metrics_logger.log_finished(
+                        rid=rid,
+                        finish_reason=recv_obj.finished_reasons[i],
+                        prompt_tokens=recv_obj.prompt_tokens[i],
+                        completion_tokens=completion_tokens,
+                        time_stats=state.time_stats,
+                        scheduler_time_stats=(
+                            recv_obj.time_stats[i]
+                            if recv_obj.time_stats is not None
+                            else None
+                        ),
                     )
 
                 self._remove_req_state(rid)
