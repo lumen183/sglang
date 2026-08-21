@@ -196,7 +196,10 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
 
 
 SGLANG_SCORE_METRICS_LOGGING = get_bool_env_var("SGLANG_SCORE_METRICS_LOGGING")
-SGLANG_SCORE_METRICS_WARMUP_RID_PREFIX = "METACAMP_WARMUP_"
+SGLANG_SCORE_METRICS_INTERNAL_RID_PREFIXES = (
+    HEALTH_CHECK_RID_PREFIX,
+    "METACAMP_WARMUP_",
+)
 
 
 @dataclasses.dataclass
@@ -241,9 +244,7 @@ class ScoreMetricsLogger:
         # Aborted requests, SGLang health checks, and explicitly tagged warmup
         # requests are not valid scored completions. Still log them so an
         # interrupted or warming-up run remains visible for diagnostics.
-        excluded = rid.startswith(HEALTH_CHECK_RID_PREFIX) or rid.startswith(
-            SGLANG_SCORE_METRICS_WARMUP_RID_PREFIX
-        )
+        excluded = rid.startswith(SGLANG_SCORE_METRICS_INTERNAL_RID_PREFIXES)
         included = reason_type != "abort" and not excluded
         if included:
             self.completed_requests += 1
