@@ -24,8 +24,8 @@ export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-tailscale0}"
 MODEL_PATH=${MODEL_PATH:-/home/jovyan/whw/models/DeepSeek-V4-Flash-0731}
 GSM8K_DATA_PATH=${GSM8K_DATA_PATH:-/home/jovyan/whw/datasets/gsm8k}
 NUM_EXAMPLES=${NUM_EXAMPLES:-200}
-NUM_THREADS=${NUM_THREADS:-4}
-NUM_SHOTS=${NUM_SHOTS:-20}
+NUM_THREADS=${NUM_THREADS:-8}
+NUM_SHOTS=${NUM_SHOTS:-24}
 MIN_SCORE=${MIN_SCORE:-0.93}
 TOP_K=${TOP_K:-512}
 DEVICE_BUFFER_SIZE=${DEVICE_BUFFER_SIZE:-4096}
@@ -85,7 +85,7 @@ prefill=(
   "$PYTHON_BIN" -m sglang.launch_server "${common[@]}"
   --port "$PREFILL_PORT" --disaggregation-mode prefill
   --disaggregation-bootstrap-port "$DISAGGREGATION_BOOTSTRAP_PORT"
-  --disaggregation-transfer-backend nixl
+  --disaggregation-transfer-backend mooncake
   --nccl-port "$PREFILL_NCCL_PORT" --tp "$PREFILL_TP"
   --base-gpu-id "$PREFILL_BASE_GPU_ID"
 )
@@ -93,7 +93,7 @@ decode=(
   "$PYTHON_BIN" -m sglang.launch_server "${common[@]}"
   --port "$DECODE_PORT" --disaggregation-mode decode
   --disaggregation-bootstrap-port "$DISAGGREGATION_BOOTSTRAP_PORT"
-  --disaggregation-transfer-backend nixl
+  --disaggregation-transfer-backend mooncake
   --nccl-port "$DECODE_NCCL_PORT" --tp "$DECODE_TP"
   --base-gpu-id "$DECODE_BASE_GPU_ID"
 )
@@ -105,12 +105,24 @@ if [[ "$mode" == hybrid-* ]]; then
 fi
 
 pids=()
+watchdog_pid=""
 cleanup() {
+  trap - EXIT INT TERM
+  if [[ -n "$watchdog_pid" ]]; then
+    kill "$watchdog_pid" 2>/dev/null || true
+  fi
   for pid in "${pids[@]}"; do
     kill -TERM -- "-$pid" 2>/dev/null || true
   done
+  # A failed server can leave grandchildren behind. Give them a short grace
+  # period, then make sure the GPUQ child command really exits.
+  sleep 2
+  for pid in "${pids[@]}"; do
+    kill -KILL -- "-$pid" 2>/dev/null || true
+  done
 }
 trap cleanup EXIT
+trap 'exit 1' INT TERM
 
 setsid "${prefill[@]}" >"$RUN_DIR/prefill.log" 2>&1 &
 pids+=("$!")
@@ -118,10 +130,24 @@ setsid "${decode[@]}" >"$RUN_DIR/decode.log" 2>&1 &
 pids+=("$!")
 
 wait_ready() {
-  until curl -sf "$1" >/dev/null; do sleep 2; done
+  local url=$1
+  local pid=$2
+  local name=$3
+  local deadline=$((SECONDS + ${READY_TIMEOUT:-900}))
+  while ! curl -sf --max-time 5 "$url" >/dev/null; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "$name (pid=$pid) exited before becoming ready" >&2
+      return 1
+    fi
+    if (( SECONDS >= deadline )); then
+      echo "timed out waiting for $name at $url" >&2
+      return 1
+    fi
+    sleep 2
+  done
 }
-wait_ready "http://127.0.0.1:$PREFILL_PORT/health"
-wait_ready "http://127.0.0.1:$DECODE_PORT/health"
+wait_ready "http://127.0.0.1:$PREFILL_PORT/health" "${pids[0]}" prefill
+wait_ready "http://127.0.0.1:$DECODE_PORT/health" "${pids[1]}" decode
 
 setsid "$PYTHON_BIN" -m sglang_router.launch_router \
   --pd-disaggregation --mini-lb \
@@ -129,7 +155,58 @@ setsid "$PYTHON_BIN" -m sglang_router.launch_router \
   --decode "http://127.0.0.1:$DECODE_PORT" \
   --host 127.0.0.1 --port "$ROUTER_PORT" >"$RUN_DIR/router.log" 2>&1 &
 pids+=("$!")
-wait_ready "http://127.0.0.1:$ROUTER_PORT/health"
+wait_ready "http://127.0.0.1:$ROUTER_PORT/health" "${pids[2]}" router
+
+# GPUQ supervises this shell, not the three servers above. If a server crashes
+# after startup, force this shell to exit so GPUQ can reap the allocation.
+watchdog() {
+  local parent_pid=$1
+  shift
+  local prefill_failures=0 decode_failures=0 router_failures=0
+  while sleep 2; do
+    local url pid name
+    local index=0
+    while (( index < $# )); do
+      url=$1
+      pid=$2
+      name=$3
+      shift 3
+      if ! kill -0 "$pid" 2>/dev/null; then
+        echo "managed server $name (pid=$pid) exited; aborting GPUQ job" >&2
+        kill -TERM "$parent_pid" 2>/dev/null || true
+        return 0
+      fi
+      if ! curl -sf --max-time 5 "$url" >/dev/null; then
+        case "$name" in
+          prefill) ((prefill_failures += 1)) ;;
+          decode) ((decode_failures += 1)) ;;
+          router) ((router_failures += 1)) ;;
+        esac
+        if ((
+          prefill_failures >= ${HEALTHCHECK_FAILURES:-3} ||
+          decode_failures >= ${HEALTHCHECK_FAILURES:-3} ||
+          router_failures >= ${HEALTHCHECK_FAILURES:-3}
+        )); then
+          echo "managed server $name failed health checks; aborting GPUQ job" >&2
+          kill -TERM "$parent_pid" 2>/dev/null || true
+          return 0
+        fi
+      else
+        case "$name" in
+          prefill) prefill_failures=0 ;;
+          decode) decode_failures=0 ;;
+          router) router_failures=0 ;;
+        esac
+      fi
+      index=$((index + 3))
+    done
+  done
+}
+watchdog "$$" \
+  "http://127.0.0.1:$PREFILL_PORT/health" "${pids[0]}" prefill \
+  "http://127.0.0.1:$DECODE_PORT/health" "${pids[1]}" decode \
+  "http://127.0.0.1:$ROUTER_PORT/health" "${pids[2]}" router &
+watchdog_pid=$!
 
 "$PYTHON_BIN" "$SCRIPT_DIR/run_gsm8k.py" \
   --base-url "http://127.0.0.1:$ROUTER_PORT" --model "$MODEL_PATH" \
