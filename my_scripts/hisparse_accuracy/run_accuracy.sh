@@ -21,7 +21,7 @@ fi
 # Tailscale interface by default; callers can override this for other hosts.
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-tailscale0}"
 
-MODEL_PATH=${MODEL_PATH:-/home/jovyan/whw/models/DeepSeek-V4-Flash-0731-W8A8}
+MODEL_PATH=${MODEL_PATH:-/home/jovyan/whw/models/DeepSeek-V4-Flash-0731}
 GSM8K_DATA_PATH=${GSM8K_DATA_PATH:-/home/jovyan/whw/datasets/gsm8k}
 NUM_EXAMPLES=${NUM_EXAMPLES:-200}
 NUM_THREADS=${NUM_THREADS:-4}
@@ -65,7 +65,9 @@ case "$mode" in
 esac
 
 export PYTHONPATH="$REPO_ROOT/python${PYTHONPATH:+:$PYTHONPATH}"
-export SGLANG_DSV4_FP4_EXPERTS=0
+# Do not force a routed-expert quantization layout. SGLang probes the local
+# checkpoint and selects MXFP4, converted FP8, or the declared layout.
+unset SGLANG_DSV4_FP4_EXPERTS
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256
 export MC_TCP_ENABLE_CONNECTION_POOL=true
 

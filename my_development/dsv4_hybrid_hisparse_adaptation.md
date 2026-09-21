@@ -259,7 +259,7 @@ PY
 模型和数据统一使用：
 
 ```text
-/home/jovyan/whw/models/DeepSeek-V4-Flash-0731-W8A8
+/home/jovyan/whw/models/DeepSeek-V4-Flash-0731
 /home/jovyan/whw/datasets/gsm8k
 ```
 
