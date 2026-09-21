@@ -264,6 +264,10 @@ class HiSparseCoordinator:
         self._skip_first_backup = [False] * max_num_req_slots
         self._resident_reqs: OrderedDict[int, Req] = OrderedDict()
         self._resident_ready_queue: List[Req] = []
+        # Hybrid requests stay GPU-resident, but their complete C4 history is
+        # mirrored asynchronously so a later pressure reclaim never has to
+        # copy the whole request on the scheduler thread.
+        self._resident_mirror_events: Dict[int, device_module.Event] = {}
         self._resident_mask = torch.zeros(
             max_num_req_slots, dtype=torch.bool, device=device
         )
@@ -384,6 +388,7 @@ class HiSparseCoordinator:
         self._resident_mask[req_idx] = True
         req.hisparse_staging = False
         self._resident_ready_queue.append(req)
+        self._enqueue_resident_mirror(req)
         logger.debug("HiSparse hybrid: keeping request %s C4-resident", req.rid)
         # vLLM evaluates the transition watermark at scheduling boundaries,
         # not only after an allocation has already failed.  The admission hook
@@ -393,9 +398,61 @@ class HiSparseCoordinator:
         if self.hybrid_mode and self.hybrid_policy.is_under_pressure(free_blocks):
             self.reclaim_c4_tokens(0)
 
+    def _enqueue_resident_mirror(self, req: Req) -> None:
+        """Mirror a resident request's complete C4 history asynchronously."""
+        req_idx = req.kv.req_pool_idx
+        allocated_len = req.kv.kv_allocated_len
+        full_kv_indices = self.req_to_token_pool.req_to_token[
+            req_idx, :allocated_len
+        ].to(dtype=torch.int64, copy=True)
+        device_indices = self.mem_pool_device.translate_loc_from_full_to_hisparse_device(
+            full_kv_indices
+        )
+        host_indices = self.mem_pool_host.alloc_paged_token_slots(
+            self.req_to_host_pool,
+            self.req_to_host_pool_allocated_len,
+            req_idx,
+            0,
+            len(device_indices),
+        )
+
+        # Record the producer stream before enqueueing the host copy. The event
+        # is the publication boundary for the mirror and for later reclaim.
+        producer_event = device_module.Event()
+        producer_event.record()
+        finish_event = device_module.Event()
+        with device_module.stream(self.write_staging_stream):
+            producer_event.wait(self.write_staging_stream)
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device,
+                host_indices,
+                device_indices,
+                io_backend="kernel",
+            )
+            finish_event.record()
+            if host_indices.is_cuda:
+                host_indices.record_stream(self.write_staging_stream)
+            if device_indices.is_cuda:
+                device_indices.record_stream(self.write_staging_stream)
+
+        self._resident_mirror_events[req_idx] = finish_event
+        # The complete prefill history is already mirrored. Avoid backing up
+        # the same rows on the first decode step.
+        self._skip_first_backup[req_idx] = True
+
+    def _resident_mirror_ready(self, req_idx: int) -> bool:
+        event = self._resident_mirror_events.get(req_idx)
+        return event is None or event.query()
+
     def _spill_resident_request(self, req: Req) -> int:
         req_idx = req.kv.req_pool_idx
         if req_idx not in self._resident_reqs:
+            return 0
+
+        # A request cannot release its C4 pages until the asynchronous full
+        # mirror is published. Leave it resident for a later reclaim pass.
+        mirror_event = self._resident_mirror_events.get(req_idx)
+        if mirror_event is not None and not mirror_event.query():
             return 0
 
         allocated_len = req.kv.kv_allocated_len
@@ -427,13 +484,14 @@ class HiSparseCoordinator:
         try:
             if self.decode_producer_stream is not None:
                 device_module.current_stream().wait_stream(self.decode_producer_stream)
-            self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device,
-                host_indices,
-                device_indices,
-                io_backend="kernel",
-            )
-            device_module.current_stream().synchronize()
+            if previous_host_len < len(device_indices):
+                self.mem_pool_host.backup_from_device_all_layer(
+                    self.mem_pool_device,
+                    host_indices[previous_host_len:],
+                    device_indices[previous_host_len:],
+                    io_backend="kernel",
+                )
+                device_module.current_stream().synchronize()
             self.alloc_device_buffer(req)
         except Exception:
             allocated_len = int(self.req_to_host_pool_allocated_len[req_idx])
@@ -448,6 +506,7 @@ class HiSparseCoordinator:
                 self.req_to_host_pool_allocated_len[req_idx] = previous_host_len
             raise
         self._resident_reqs.pop(req_idx, None)
+        self._resident_mirror_events.pop(req_idx, None)
         self._resident_mask[req_idx] = False
         self._skip_first_backup[req_idx] = True
         after = self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
@@ -468,6 +527,9 @@ class HiSparseCoordinator:
         host copy is complete.  This keeps the policy/page accounting aligned
         with vLLM while the page table and transfer kernels remain unchanged.
         """
+        # The incremental decode backup may still read resident C4 slots. Drain
+        # it before any request is allowed to release those slots.
+        self.wait_for_pending_backup()
         allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
         free_blocks = allocator.available_size() // self.page_size
         missing_blocks = (missing_tokens + self.page_size - 1) // self.page_size
@@ -901,8 +963,6 @@ class HiSparseCoordinator:
         backup_indices = []
         for i in range(len(seq_lens_cpu)):
             req_idx = int(req_pool_indices_cpu[i])
-            if self.hybrid_mode and req_idx in self._resident_reqs:
-                continue
             if self._skip_first_backup[req_idx]:
                 self._skip_first_backup[req_idx] = False
                 continue
@@ -928,6 +988,28 @@ class HiSparseCoordinator:
         buffer_slot = actual_compressed_pos.clamp(max=self.device_buffer_size)
 
         device_locs = self.req_to_device_buffer[backup_req_indices, buffer_slot]
+        if self.hybrid_mode:
+            resident_rows = self._resident_mask[backup_req_indices]
+            if torch.any(resident_rows):
+                resident_positions = (
+                    actual_compressed_pos[resident_rows] * self.compress_ratio
+                    + (self.compress_ratio - 1)
+                )
+                resident_full_locs = self.req_to_token_pool.req_to_token[
+                    backup_req_indices[resident_rows], resident_positions
+                ]
+                resident_compressed_locs = (
+                    self.mem_pool_device.translate_loc_from_full_to_compressed(
+                        resident_full_locs
+                    )
+                )
+                resident_device_locs = (
+                    self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                        resident_compressed_locs
+                    ]
+                )
+                device_locs = device_locs.clone()
+                device_locs[resident_rows] = resident_device_locs
 
         host_locs_list = []
         for i in backup_indices:
@@ -1116,6 +1198,9 @@ class HiSparseCoordinator:
         # re-frees them (double-free into the page allocator's free list).
         allocated_len = req.kv.kv_allocated_len
         req_idx = req.kv.req_pool_idx
+        mirror_event = self._resident_mirror_events.pop(req_idx, None)
+        if mirror_event is not None and not mirror_event.query():
+            mirror_event.synchronize()
         was_resident = self._resident_reqs.pop(req_idx, None) is not None
         self._resident_mask[req_idx] = False
         self._resident_ready_queue = [
