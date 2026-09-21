@@ -79,6 +79,84 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             "SWA eviction short",
         )
 
+    def test_c4_pressure_invokes_registered_reclaimer(self):
+        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        allocator.hisparse_page_size = 64
+        allocator.hisparse_attn_allocator = SimpleNamespace(
+            available_size=MagicMock(side_effect=[64, 192])
+        )
+        reclaimer = MagicMock(return_value=128)
+        allocator._c4_reclaim_callback = reclaimer
+
+        self.assertTrue(allocator._ensure_c4_pages(3))
+        reclaimer.assert_called_once_with(128)
+
+    def test_c4_pressure_without_reclaimer_fails_cleanly(self):
+        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        allocator.hisparse_page_size = 64
+        allocator.hisparse_attn_allocator = SimpleNamespace(
+            available_size=MagicMock(return_value=64)
+        )
+        allocator._c4_reclaim_callback = None
+
+        self.assertFalse(allocator._ensure_c4_pages(2))
+
+
+class TestDeepSeekV4HybridHiSparsePolicy(CustomTestCase):
+    def test_reclaim_is_fifo_and_respects_protected_requests(self):
+        from collections import OrderedDict
+
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = object.__new__(HiSparseCoordinator)
+        req0 = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=0))
+        req1 = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=1))
+        req2 = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=2))
+        coordinator._resident_reqs = OrderedDict([(0, req0), (1, req1), (2, req2)])
+        coordinator._reclaim_protected_req_indices = {0}
+        coordinator._hybrid_reclaim_watermark_tokens = 32
+        coordinator._spill_resident_request = MagicMock(side_effect=[64, 64])
+
+        self.assertEqual(coordinator.reclaim_c4_tokens(80), 128)
+        self.assertEqual(
+            [
+                call.args[0]
+                for call in coordinator._spill_resident_request.call_args_list
+            ],
+            [req1, req2],
+        )
+
+    def test_resident_topk_resolves_c4_mapping_and_masks_invalid_positions(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = object.__new__(HiSparseCoordinator)
+        coordinator.compress_ratio = 4
+        coordinator.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.tensor(
+                [
+                    list(range(64, 80)),
+                    list(range(128, 144)),
+                ],
+                dtype=torch.int32,
+            )
+        )
+        mapping = torch.arange(64, dtype=torch.int64) + 1000
+        coordinator.mem_pool_device = SimpleNamespace(
+            translate_loc_from_full_to_compressed=lambda full: full // 4,
+            full_to_hisparse_device_index_mapping=mapping,
+        )
+
+        result = coordinator._resolve_resident_topk(
+            req_pool_indices=torch.tensor([0, 1]),
+            compressed_seq_lens=torch.tensor([4, 2]),
+            top_k_result=torch.tensor([[0, 3, -1], [1, 99, -1]]),
+        )
+
+        self.assertEqual(
+            result.tolist(),
+            [[1016, 1019, -1], [1033, -1, -1]],
+        )
+
     def test_hisparse_budget_uses_full_logical_capacity_for_swa_tail(self):
         from sglang.srt.disaggregation.decode import DecodePreallocQueue
 

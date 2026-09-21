@@ -75,11 +75,15 @@ def _parse_sparse_config() -> SparseConfig:
             raise ValueError(f"Failed to parse hisparse_config: {e}") from e
     else:
         extra_config = {}
+    if not isinstance(extra_config, dict):
+        raise ValueError("hisparse_config must be a JSON object")
 
     top_k = extra_config.pop("top_k", 2048)
     device_buffer_size = extra_config.pop("device_buffer_size", 2 * top_k)
     host_to_device_ratio = extra_config.pop("host_to_device_ratio", 2)
     swap_in_block_size = extra_config.pop("swap_in_block_size", 960)
+    hybrid_mode = extra_config.pop("hybrid_mode", False)
+    hybrid_reclaim_watermark = extra_config.pop("hybrid_reclaim_watermark", 0.1)
 
     if device_buffer_size < top_k:
         raise ValueError(
@@ -93,6 +97,20 @@ def _parse_sparse_config() -> SparseConfig:
         raise ValueError(
             f"swap_in_block_size ({swap_in_block_size}) must be in the range [1, 1024]"
         )
+    if not isinstance(hybrid_mode, bool):
+        raise ValueError(f"hybrid_mode must be a boolean, got {hybrid_mode!r}")
+    if not isinstance(hybrid_reclaim_watermark, (int, float)) or isinstance(
+        hybrid_reclaim_watermark, bool
+    ):
+        raise ValueError(
+            "hybrid_reclaim_watermark must be a number in [0, 1), got "
+            f"{hybrid_reclaim_watermark!r}"
+        )
+    if not 0 <= hybrid_reclaim_watermark < 1:
+        raise ValueError(
+            "hybrid_reclaim_watermark must be in [0, 1), got "
+            f"{hybrid_reclaim_watermark}"
+        )
 
     algorithm = extra_config.pop("algorithm", None)
     backend = extra_config.pop("backend", None)
@@ -104,6 +122,8 @@ def _parse_sparse_config() -> SparseConfig:
         device_buffer_size=device_buffer_size,
         host_to_device_ratio=host_to_device_ratio,
         swap_in_block_size=swap_in_block_size,
+        hybrid_mode=hybrid_mode,
+        hybrid_reclaim_watermark=float(hybrid_reclaim_watermark),
         algorithm=algorithm,
         backend=backend,
         page_size=page_size,
