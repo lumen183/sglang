@@ -1,4 +1,5 @@
 import weakref
+from typing import Callable, Optional
 
 import torch
 
@@ -310,6 +311,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_pages = None
         self.free_group = None
         self.full_free_group = []
+        self._c4_reclaim_callback: Optional[Callable[[int], int]] = None
         self.clear()
 
         self.hisparse_kvcache.register_mapping(
@@ -409,6 +411,29 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         raise NotImplementedError(
             "DeepSeek V4 HiSparse allocator does not support direct token allocation; "
             "use alloc_extend or alloc_decode instead."
+        )
+
+    def set_c4_reclaim_callback(self, callback: Optional[Callable[[int], int]]) -> None:
+        """Register the scheduler-owned resident-to-host reclaim callback.
+
+        The allocator only reports C4 pressure. Request selection, stream
+        ordering, and host ownership remain coordinator responsibilities.
+        """
+        self._c4_reclaim_callback = callback
+
+    def _ensure_c4_pages(self, num_new_pages: int) -> bool:
+        available_pages = (
+            self.hisparse_attn_allocator.available_size() // self.hisparse_page_size
+        )
+        if num_new_pages <= available_pages:
+            return True
+        if self._c4_reclaim_callback is None:
+            return False
+        missing_tokens = (num_new_pages - available_pages) * self.hisparse_page_size
+        self._c4_reclaim_callback(missing_tokens)
+        return (
+            num_new_pages
+            <= self.hisparse_attn_allocator.available_size() // self.hisparse_page_size
         )
 
     def alloc_logical_only(
@@ -536,10 +561,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             > self.logical_attn_allocator.available_size() // self.page_size
         ):
             return None
-        if (
-            num_new_pages_hisparse
-            > self.hisparse_attn_allocator.available_size() // self.hisparse_page_size
-        ):
+        if not self._ensure_c4_pages(num_new_pages_hisparse):
             return None
 
         logical_indices = self.logical_attn_allocator.alloc_extend(

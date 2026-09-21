@@ -984,6 +984,8 @@ class ModelRunner:
             ),
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
+            hybrid_mode=hisparse_cfg.hybrid_mode,
+            hybrid_reclaim_watermark=hisparse_cfg.hybrid_reclaim_watermark,
             shared_index_layers=resolve_shared_index_layers(
                 hf_text_config=self.model_config.hf_text_config,
                 pp_size=get_parallel().pp_size,

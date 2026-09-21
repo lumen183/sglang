@@ -1,6 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
+from collections import OrderedDict
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
@@ -24,6 +25,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.utils import get_device_module, is_hip
+from sglang.srt.utils.common import get_num_new_pages
 
 device_module = get_device_module()
 
@@ -122,6 +124,8 @@ class HiSparseCoordinator:
         tp_group,
         host_to_device_ratio: int = 2,
         swap_in_block_size: int = 960,
+        hybrid_mode: bool = False,
+        hybrid_reclaim_watermark: float = 0.1,
         shared_index_layers: Optional[List[bool]] = None,
     ):
         self.req_to_token_pool = req_to_token_pool
@@ -138,6 +142,9 @@ class HiSparseCoordinator:
         self.is_dsv4_hisparse = isinstance(
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
         )
+        self.hybrid_mode = hybrid_mode
+        if self.hybrid_mode and not self.is_dsv4_hisparse:
+            raise ValueError("hybrid_mode currently supports DeepSeek V4 only")
         if self.is_dsv4_hisparse:
             self.mem_pool_device = self.token_to_kv_pool_allocator.hisparse_kvcache
             page_size = self.mem_pool_device.page_size
@@ -255,6 +262,20 @@ class HiSparseCoordinator:
         # CPU flag: True means "skip backup on the next decode step" because
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_req_slots
+        self._resident_reqs: OrderedDict[int, Req] = OrderedDict()
+        self._resident_ready_queue: List[Req] = []
+        self._resident_mask = torch.zeros(
+            max_num_req_slots, dtype=torch.bool, device=device
+        )
+        self._reclaim_protected_req_indices: set[int] = set()
+        self._hybrid_reclaim_watermark_tokens = int(
+            self.token_to_kv_pool_allocator.hisparse_attn_allocator.size
+            * hybrid_reclaim_watermark
+        )
+        if self.hybrid_mode:
+            self.token_to_kv_pool_allocator.set_c4_reclaim_callback(
+                self.reclaim_c4_tokens
+            )
 
         self._init_shared_index_prefetch(
             shared_index_layers=shared_index_layers,
@@ -326,7 +347,107 @@ class HiSparseCoordinator:
         if self.enable_prefetch:
             # Skip-layer copies read the pinned host pool on the prefetch stream.
             self.prefetch_stream.synchronize()
+        if self.hybrid_mode:
+            self.token_to_kv_pool_allocator.set_c4_reclaim_callback(None)
         self.mem_pool_host.destroy()
+
+    def admit_request(self, req: Req) -> None:
+        """Move a completed prefill into decode.
+
+        Hybrid DSv4 requests remain fully C4-resident until allocator pressure
+        asks the coordinator to demote them. Native HiSparse keeps the existing
+        eager staging behavior.
+        """
+        if not self.hybrid_mode:
+            self.admit_request_into_staging(req)
+            return
+
+        req_idx = req.kv.req_pool_idx
+        self._resident_reqs[req_idx] = req
+        self._resident_mask[req_idx] = True
+        req.hisparse_staging = False
+        self._resident_ready_queue.append(req)
+        logger.debug("HiSparse hybrid: keeping request %s C4-resident", req.rid)
+
+    def _spill_resident_request(self, req: Req) -> int:
+        req_idx = req.kv.req_pool_idx
+        if req_idx not in self._resident_reqs:
+            return 0
+
+        allocated_len = req.kv.kv_allocated_len
+        full_kv_indices = self.req_to_token_pool.req_to_token[
+            req_idx, :allocated_len
+        ].to(dtype=torch.int64, copy=True)
+        device_indices = (
+            self.mem_pool_device.translate_loc_from_full_to_hisparse_device(
+                full_kv_indices
+            )
+        )
+        if len(device_indices) <= self.padded_buffer_size:
+            # This request cannot release any C4 capacity by switching to its
+            # fixed-size hot buffer. Do not reconsider it on every reclaim.
+            self._resident_reqs.move_to_end(req_idx)
+            return 0
+
+        previous_host_len = int(self.req_to_host_pool_allocated_len[req_idx])
+        host_indices = self.mem_pool_host.alloc_paged_token_slots(
+            self.req_to_host_pool,
+            self.req_to_host_pool_allocated_len,
+            req_idx,
+            0,
+            len(device_indices),
+        )
+        before = (
+            self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
+        )
+        try:
+            if self.decode_producer_stream is not None:
+                device_module.current_stream().wait_stream(self.decode_producer_stream)
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device,
+                host_indices,
+                device_indices,
+                io_backend="kernel",
+            )
+            device_module.current_stream().synchronize()
+            self.alloc_device_buffer(req)
+        except Exception:
+            allocated_len = int(self.req_to_host_pool_allocated_len[req_idx])
+            if allocated_len > previous_host_len:
+                newly_allocated = self.req_to_host_pool[
+                    req_idx, previous_host_len:allocated_len
+                ]
+                newly_allocated = newly_allocated[newly_allocated >= 0]
+                if newly_allocated.numel() > 0:
+                    self.mem_pool_host.free(newly_allocated)
+                self.req_to_host_pool[req_idx, previous_host_len:allocated_len] = -1
+                self.req_to_host_pool_allocated_len[req_idx] = previous_host_len
+            raise
+        self._resident_reqs.pop(req_idx, None)
+        self._resident_mask[req_idx] = False
+        self._skip_first_backup[req_idx] = True
+        after = self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
+        freed = max(after - before, 0)
+        logger.info(
+            "HiSparse hybrid: demoted request %s to host-backed top-k; "
+            "freed %d C4 slots",
+            req.rid,
+            freed,
+        )
+        return freed
+
+    def reclaim_c4_tokens(self, missing_tokens: int) -> int:
+        """Demote oldest resident requests until C4 allocation can proceed."""
+        target = missing_tokens + self._hybrid_reclaim_watermark_tokens
+        freed = 0
+        candidates = list(self._resident_reqs.items())
+        for req_idx, req in candidates:
+            if req_idx in self._reclaim_protected_req_indices:
+                continue
+            freed += self._spill_resident_request(req)
+            if freed >= target:
+                break
+        return freed
 
     def get_token_stats(self) -> HiSparseTokenStats:
         device_allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
@@ -562,7 +683,8 @@ class HiSparseCoordinator:
         return len(self.ack_staging_queue) > 0
 
     def collect_ready_reqs(self) -> List[Req]:
-        ready_reqs: List[Req] = []
+        ready_reqs = self._resident_ready_queue
+        self._resident_ready_queue = []
         if len(self.ack_staging_queue) == 0:
             return ready_reqs
 
@@ -644,23 +766,81 @@ class HiSparseCoordinator:
         active_req_pool_indices = req_pool_indices[active_reqs]
 
         compressed_seq_lens = active_seq_lens // self.compress_ratio
-        reserved_positions = (compressed_seq_lens - 1).clamp(
-            max=self.device_buffer_size
-        )
-        reserved_buffer_loc = self.req_to_device_buffer[
-            active_req_pool_indices, reserved_positions
-        ]
-
-        self.req_device_buffer_token_locs[
-            :, active_req_pool_indices, self.device_buffer_size
-        ] = reserved_buffer_loc.to(torch.int32)
-
         compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
             active_out_cache_loc
         )
-        self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = (
-            reserved_buffer_loc
-        )
+        resident_rows = self._resident_mask[active_req_pool_indices]
+
+        if torch.any(resident_rows):
+            resident_req_indices = active_req_pool_indices[resident_rows]
+            resident_seq_lens = compressed_seq_lens[resident_rows]
+            resident_seq_lens_cpu = resident_seq_lens.to("cpu")
+            previous_token_positions = (
+                active_seq_lens[resident_rows] - self.compress_ratio - 1
+            )
+            safe_previous_positions = previous_token_positions.clamp(min=0)
+            previous_full_locs = self.req_to_token_pool.req_to_token[
+                resident_req_indices, safe_previous_positions
+            ]
+            previous_compressed_locs = (
+                self.mem_pool_device.translate_loc_from_full_to_compressed(
+                    previous_full_locs
+                )
+            )
+            previous_device_locs = (
+                self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                    previous_compressed_locs
+                ]
+            )
+            previous_device_locs = torch.where(
+                previous_token_positions < 0,
+                torch.full_like(previous_device_locs, -1),
+                previous_device_locs,
+            )
+
+            protected = {int(x) for x in resident_req_indices.to("cpu").tolist()}
+            self._reclaim_protected_req_indices.update(protected)
+            try:
+                num_new_pages = get_num_new_pages(
+                    seq_lens=resident_seq_lens_cpu,
+                    page_size=self.hisparse_page_size,
+                    decode=True,
+                )
+                if not self.token_to_kv_pool_allocator._ensure_c4_pages(num_new_pages):
+                    raise RuntimeError(
+                        "HiSparse hybrid could not reclaim enough resident C4 pages"
+                    )
+                resident_device_locs = self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc_decode(
+                    resident_seq_lens,
+                    resident_seq_lens_cpu,
+                    previous_device_locs,
+                )
+                if resident_device_locs is None:
+                    raise RuntimeError(
+                        "HiSparse hybrid could not allocate resident C4 decode pages"
+                    )
+            finally:
+                self._reclaim_protected_req_indices.difference_update(protected)
+
+            self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                compressed_locs[resident_rows]
+            ] = resident_device_locs
+
+        host_rows = ~resident_rows
+        if torch.any(host_rows):
+            host_req_indices = active_req_pool_indices[host_rows]
+            reserved_positions = (compressed_seq_lens[host_rows] - 1).clamp(
+                max=self.device_buffer_size
+            )
+            reserved_buffer_loc = self.req_to_device_buffer[
+                host_req_indices, reserved_positions
+            ]
+            self.req_device_buffer_token_locs[
+                :, host_req_indices, self.device_buffer_size
+            ] = reserved_buffer_loc.to(torch.int32)
+            self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                compressed_locs[host_rows]
+            ] = reserved_buffer_loc
 
     def _eager_backup_previous_token(
         self,
@@ -687,6 +867,8 @@ class HiSparseCoordinator:
         backup_indices = []
         for i in range(len(seq_lens_cpu)):
             req_idx = int(req_pool_indices_cpu[i])
+            if self.hybrid_mode and req_idx in self._resident_reqs:
+                continue
             if self._skip_first_backup[req_idx]:
                 self._skip_first_backup[req_idx] = False
                 continue
@@ -899,18 +1081,25 @@ class HiSparseCoordinator:
         # subsequent release_kv_cache -> allocator.free -> free_hisparse path
         # re-frees them (double-free into the page allocator's free list).
         allocated_len = req.kv.kv_allocated_len
+        req_idx = req.kv.req_pool_idx
+        was_resident = self._resident_reqs.pop(req_idx, None) is not None
+        self._resident_mask[req_idx] = False
+        self._resident_ready_queue = [
+            pending for pending in self._resident_ready_queue if pending is not req
+        ]
+
+        allocated_locs = self.req_to_token_pool.req_to_token[req_idx, :allocated_len]
 
         # release memory -- only free actually-allocated buffer indices
-        current_cap = int(self.req_device_buffer_size[req.kv.req_pool_idx])
-        if current_cap > 0:
-            side_buf_hi = self.req_to_device_buffer[req.kv.req_pool_idx, :current_cap]
+        current_cap = int(self.req_device_buffer_size[req_idx])
+        if was_resident:
+            self.token_to_kv_pool_allocator.free_hisparse(allocated_locs)
+        elif current_cap > 0:
+            side_buf_hi = self.req_to_device_buffer[req_idx, :current_cap]
             all_hi = torch.unique(side_buf_hi[side_buf_hi > 0])
             if all_hi.numel() > 0:
                 self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
 
-        allocated_locs = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, :allocated_len
-        ]
         compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
             allocated_locs
         )
@@ -918,21 +1107,21 @@ class HiSparseCoordinator:
 
         host_indices = self.mem_pool_host.allocated_host_indices(
             self.req_to_host_pool,
-            req.kv.req_pool_idx,
-            self.req_to_host_pool_allocated_len[req.kv.req_pool_idx],
+            req_idx,
+            self.req_to_host_pool_allocated_len[req_idx],
         )
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
 
         # clear req info
-        self.req_device_buffer_tokens[:, req.kv.req_pool_idx, :] = -1
-        self.req_device_buffer_token_locs[:, req.kv.req_pool_idx, :] = -1
-        self.req_to_device_buffer[req.kv.req_pool_idx, :] = 0
-        self.req_device_buffer_size[req.kv.req_pool_idx] = 0
-        self.req_to_host_pool[req.kv.req_pool_idx, :] = -1
-        self.req_to_host_pool_allocated_len[req.kv.req_pool_idx] = 0
-        self.lru_slots[:, req.kv.req_pool_idx, :].copy_(self._lru_init)
-        self._skip_first_backup[req.kv.req_pool_idx] = False
+        self.req_device_buffer_tokens[:, req_idx, :] = -1
+        self.req_device_buffer_token_locs[:, req_idx, :] = -1
+        self.req_to_device_buffer[req_idx, :] = 0
+        self.req_device_buffer_size[req_idx] = 0
+        self.req_to_host_pool[req_idx, :] = -1
+        self.req_to_host_pool_allocated_len[req_idx] = 0
+        self.lru_slots[:, req_idx, :].copy_(self._lru_init)
+        self._skip_first_backup[req_idx] = False
 
     def _run_swap_in_kernel(
         self,
@@ -1002,6 +1191,32 @@ class HiSparseCoordinator:
             skip_io=self.skip_io,
         )
 
+    def _resolve_resident_topk(
+        self,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+    ) -> torch.Tensor:
+        """Resolve sequence-local C4 positions through the resident mapping."""
+        valid = (top_k_result >= 0) & (top_k_result < compressed_seq_lens.unsqueeze(1))
+        max_positions = (compressed_seq_lens - 1).clamp(min=0).unsqueeze(1)
+        compressed_positions = torch.minimum(
+            top_k_result.to(torch.int64).clamp(min=0), max_positions
+        )
+        full_positions = compressed_positions * self.compress_ratio + (
+            self.compress_ratio - 1
+        )
+        full_locs = self.req_to_token_pool.req_to_token[
+            req_pool_indices.unsqueeze(1), full_positions
+        ]
+        compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
+            full_locs.reshape(-1)
+        ).reshape_as(full_locs)
+        device_locs = self.mem_pool_device.full_to_hisparse_device_index_mapping[
+            compressed_locs
+        ].to(torch.int32)
+        return torch.where(valid, device_locs, torch.full_like(device_locs, -1))
+
     def swap_in_selected_pages(
         self,
         req_pool_indices: torch.Tensor,
@@ -1014,6 +1229,35 @@ class HiSparseCoordinator:
         With prefetch enabled, anchors swap in synchronously (recording the miss
         plan) and prefetch their skip layers' copies; skip layers just wait.
         """
+        if self.hybrid_mode:
+            resident_rows = self._resident_mask[req_pool_indices]
+            if torch.all(resident_rows):
+                resolved = self._resolve_resident_topk(
+                    req_pool_indices, compressed_seq_lens, top_k_result
+                )
+                self.top_k_device_locs_buffer[: len(req_pool_indices)].copy_(resolved)
+                return self.top_k_device_locs_buffer[: len(req_pool_indices)]
+            if torch.any(resident_rows):
+                # Initial correctness path. The dynamic partition is intentionally
+                # outside CUDA graphs; a fused resident/host resolver will replace
+                # it before enabling graph capture for hybrid mode.
+                host_rows = ~resident_rows
+                host_result = self._run_swap_in_kernel(
+                    req_pool_indices[host_rows],
+                    compressed_seq_lens[host_rows],
+                    top_k_result[host_rows],
+                    layer_id,
+                ).clone()
+                output = self.top_k_device_locs_buffer[: len(req_pool_indices)]
+                output.fill_(-1)
+                output[host_rows] = host_result
+                output[resident_rows] = self._resolve_resident_topk(
+                    req_pool_indices[resident_rows],
+                    compressed_seq_lens[resident_rows],
+                    top_k_result[resident_rows],
+                )
+                return output
+
         if not self.enable_prefetch:
             return self._run_swap_in_kernel(
                 req_pool_indices, compressed_seq_lens, top_k_result, layer_id

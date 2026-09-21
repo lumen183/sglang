@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from typing import TYPE_CHECKING
 
@@ -91,6 +92,33 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     hf_config = model_config_of(server_args).hf_config
     is_v4_hisparse = is_deepseek_v4(hf_config)
     is_hip = get_platform().is_hip
+
+    try:
+        hisparse_config = json.loads(cfg.hisparse_config or "{}")
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"--hisparse-config must be valid JSON: {exc}") from exc
+    if not isinstance(hisparse_config, dict):
+        raise ValueError("--hisparse-config must be a JSON object.")
+    hybrid_mode = hisparse_config.get("hybrid_mode", False)
+    if hybrid_mode and not is_v4_hisparse:
+        raise ValueError("HiSparse hybrid_mode currently supports DeepSeek V4 only.")
+    if hybrid_mode:
+        from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
+
+        raw_cuda_graph_config = cfg.cuda_graph_config
+        if hasattr(raw_cuda_graph_config, "decode"):
+            decode_backend = raw_cuda_graph_config.decode.backend
+        elif isinstance(raw_cuda_graph_config, dict):
+            decode_backend = raw_cuda_graph_config.get(Phase.DECODE, {}).get(
+                "backend", cfg.cuda_graph_backend_decode
+            )
+        else:
+            decode_backend = cfg.cuda_graph_backend_decode
+        if decode_backend != Backend.DISABLED:
+            raise ValueError(
+                "DeepSeek V4 HiSparse hybrid_mode currently requires "
+                "--cuda-graph-backend-decode disabled."
+            )
     assert is_deepseek_dsa(hf_config) or is_v4_hisparse, (
         "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) "
         "models (e.g., DeepSeek V3.2, GLM-5) and DeepSeek V4 now. "
