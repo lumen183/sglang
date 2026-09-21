@@ -1,45 +1,28 @@
-# DSV4 Hybrid HiSparse Accuracy Harness
+# DSV4 HiSparse 精度测试
 
-This directory contains the first-stage correctness harness for DeepSeek V4
-Hybrid HiSparse. It intentionally does not implement high-concurrency or
-throughput benchmarking.
+[设计说明](../../my_development/dsv4_hybrid_hisparse_accuracy_testing.md)
 
-Design and acceptance criteria:
-
-- [Accuracy harness design](../../my_development/dsv4_hybrid_hisparse_accuracy_testing.md)
-- [Overall adaptation plan](../../my_development/dsv4_hybrid_hisparse_adaptation.md)
-
-Run from the development machine through GPUQ:
+首次先跑 10 题：
 
 ```bash
-my_scripts/hisparse_accuracy/run_gpuq.sh h100-8 hybrid-resident
-my_scripts/hisparse_accuracy/run_gpuq.sh h200-4 hybrid-evict
+NUM_EXAMPLES=10 NUM_THREADS=1 MIN_SCORE=0 ./run_gpuq.sh h200-4 hybrid-resident
 ```
 
-Run inside the `whw_sgl` container when GPUs are already allocated:
+完整测试：
 
 ```bash
-my_scripts/hisparse_accuracy/run_accuracy.sh \
-  --hardware h200-4 \
-  --mode hybrid-resident
+./run_gpuq.sh h200-4 baseline
+./run_gpuq.sh h200-4 native
+./run_gpuq.sh h200-4 hybrid-resident
+./run_gpuq.sh h200-4 hybrid-evict
 ```
 
-Supported modes are `baseline`, `native`, `hybrid-resident`, and
-`hybrid-evict`. Override defaults through environment variables documented in
-the design document, for example:
+H100 将 `h200-4` 换成 `h100-8`。已分配 GPU 时直接运行：
 
 ```bash
-NUM_EXAMPLES=20 NUM_THREADS=1 \
-  my_scripts/hisparse_accuracy/run_accuracy.sh \
-  --hardware h200-4 --mode hybrid-resident
+./run_accuracy.sh h200-4 hybrid-resident
 ```
 
-Every run writes metadata, commands, P/D/router logs, fixed-prompt responses,
-GSM8K metrics, path-coverage results, and a Markdown summary below
-`artifacts/hisparse_accuracy/`.
+参数：`MODEL_PATH`、`GSM8K_DATA_PATH`、`NUM_EXAMPLES`、`NUM_THREADS`、`NUM_SHOTS`、`NUM_SHOTS_EVICT`、`MIN_SCORE`、`TOP_K`、`DEVICE_BUFFER_SIZE`、`HOST_TO_DEVICE_RATIO`、`RUN_DIR`。
 
-Local harness checks (no GPU required):
-
-```bash
-python3 my_scripts/hisparse_accuracy/test_harness.py
-```
+默认 200 题、20-shot、4 线程、门槛 0.93；evict 为 128-shot。结果在 `artifacts/hisparse_accuracy/`。局限：只测精度；H200 TP2 未实测；驱逐依赖长 prompt 和显存池；coverage 依赖日志；固定端口不能并行运行。

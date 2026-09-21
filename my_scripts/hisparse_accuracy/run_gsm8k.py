@@ -7,15 +7,7 @@ import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
-def resolve_dataset(path: Path) -> Path:
-    if path.is_file():
-        return path
-    for candidate in (path / "test.jsonl", path / "gsm8k" / "test.jsonl"):
-        if candidate.is_file():
-            return candidate
-    raise FileNotFoundError(
-        f"cannot find GSM8K test.jsonl below {path}; set GSM8K_DATA_PATH explicitly"
-    )
+from sglang.test.run_eval import run_eval
 
 
 def main() -> None:
@@ -27,13 +19,13 @@ def main() -> None:
     parser.add_argument("--num-examples", type=int, default=200)
     parser.add_argument("--num-threads", type=int, default=4)
     parser.add_argument("--num-shots", type=int, default=20)
-    parser.add_argument("--max-tokens", type=int, default=512)
     args = parser.parse_args()
 
-    from sglang.test.run_eval import run_eval
-
-    dataset = resolve_dataset(args.data_path)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    dataset = (
+        args.data_path
+        if args.data_path.is_file()
+        else args.data_path / "test.jsonl"
+    )
     eval_args = SimpleNamespace(
         base_url=args.base_url.rstrip("/"),
         host=None,
@@ -45,7 +37,7 @@ def main() -> None:
         num_threads=args.num_threads,
         num_shots=args.num_shots,
         gsm8k_data_path=str(dataset),
-        max_tokens=args.max_tokens,
+        max_tokens=512,
         temperature=0.0,
         top_p=1.0,
         repeat=1,
@@ -59,8 +51,7 @@ def main() -> None:
     stem = f"gsm8k_{args.model.replace('/', '_')}"
     for suffix in ("html", "json"):
         source = Path("/tmp") / f"{stem}.{suffix}"
-        if source.exists():
-            shutil.copy2(source, args.output_dir / f"gsm8k-report.{suffix}")
+        shutil.copy2(source, args.output_dir / f"gsm8k-report.{suffix}")
 
 
 if __name__ == "__main__":

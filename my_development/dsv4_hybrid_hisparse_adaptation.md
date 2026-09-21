@@ -236,9 +236,9 @@ PR #35488 的目标是让已有 DSA HiSparse 的“非 hot KV backing”可插�
 以下命令从内网宿主提交，所有真正 GPU 测试必须通过 GPUQ。H20 和 H100 分开建报告目录。
 
 ```bash
-gpuq run --project sglang --gpus 8 --timeout 12h --output "$PWD/artifacts/H20" --cwd / -- \
-  bash /home/jovyan/whw/bin/gpuq-docker-exec whw_sgl \
-  /home/jovyan/whw/sglang bash -lc '
+gpuq run --project sglang --gpus 8 --timeout 12h \
+  --output "$PWD/artifacts/H20" --cwd /home/jovyan/whw/sglang -- \
+  bash -lc '
     set -euo pipefail
     cd /home/jovyan/whw/sglang
     export PYTHONPATH=/home/jovyan/whw/sglang/python
