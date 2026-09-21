@@ -1,6 +1,12 @@
+import sys
 import unittest
+from pathlib import Path
 
-from sglang.srt.managers.hisparse_hybrid_policy import HybridHiSparsePolicy
+# Keep this pure-policy test independent of SGLang's torch-backed package
+# initializer. The module under test has no runtime dependency on torch.
+sys.path.insert(0, str(Path(__file__).parents[4] / "python/sglang/srt/managers"))
+
+from hisparse_hybrid_policy import HybridHiSparsePolicy
 
 
 class TestHybridHiSparsePolicy(unittest.TestCase):

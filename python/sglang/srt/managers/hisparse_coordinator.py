@@ -5,7 +5,6 @@ from collections import OrderedDict
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
-
 from sglang.kernels.ops.kvcache.hisparse import (
     copy_cache_planned_mla,
     load_cache_to_device_buffer_dsv4_mla,
@@ -471,9 +470,7 @@ class HiSparseCoordinator:
         allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
         free_blocks = allocator.available_size() // self.page_size
         missing_blocks = (missing_tokens + self.page_size - 1) // self.page_size
-        target_blocks = self.hybrid_policy.reclaim_target(
-            free_blocks, missing_blocks
-        )
+        target_blocks = self.hybrid_policy.reclaim_target(free_blocks, missing_blocks)
         target = target_blocks * self.page_size
         freed = 0
         candidates = list(self._resident_reqs.items())
