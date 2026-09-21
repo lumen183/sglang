@@ -14,6 +14,8 @@ hybrid hisparse 则在 gpu 压力不大时，默认全部存储在 kv cache 中�
 
 目前我在自己的 mac 上开发. gpuq 是内网服务器的 gpu 资源调度器，给出 gpuq 命令，才能在内网服务器上运行。可查看../gpuq
 
+内网使用的是 conda 管理环境，使用 /home/jovyan/whw/whw_dev 这个conda环境
+
 在内网中，家目录在`/home/jovyan/whw/`，打算使用 `~/models/DeepSeek-V4-Flash-0731` 模型和 `~/datasets/gsm8k` 数据集作为准确度验证的基准。
 
 my_scripts 放测试脚本

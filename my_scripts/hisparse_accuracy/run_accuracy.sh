@@ -9,6 +9,12 @@ hardware=${1:?usage: run_accuracy.sh HARDWARE MODE}
 mode=${2:?usage: run_accuracy.sh HARDWARE MODE}
 source "$SCRIPT_DIR/profiles/$hardware.env"
 
+PYTHON_BIN=${PYTHON_BIN:-python3}
+if [[ "$PYTHON_BIN" == */* && ! -x "$PYTHON_BIN" ]]; then
+  echo "python interpreter is not executable: $PYTHON_BIN" >&2
+  exit 1
+fi
+
 MODEL_PATH=${MODEL_PATH:-/home/jovyan/whw/models/DeepSeek-V4-Flash-0731-W8A8}
 GSM8K_DATA_PATH=${GSM8K_DATA_PATH:-/home/jovyan/whw/datasets/gsm8k}
 NUM_EXAMPLES=${NUM_EXAMPLES:-200}
@@ -57,13 +63,13 @@ common=(
 )
 
 prefill=(
-  python3 -m sglang.launch_server "${common[@]}"
+  "$PYTHON_BIN" -m sglang.launch_server "${common[@]}"
   --port 30100 --disaggregation-mode prefill
   --disaggregation-bootstrap-port 30500 --disaggregation-transfer-backend nixl
   --nccl-port 30300 --tp "$PREFILL_TP" --base-gpu-id "$PREFILL_BASE_GPU_ID"
 )
 decode=(
-  python3 -m sglang.launch_server "${common[@]}"
+  "$PYTHON_BIN" -m sglang.launch_server "${common[@]}"
   --port 30200 --disaggregation-mode decode
   --disaggregation-bootstrap-port 30500 --disaggregation-transfer-backend nixl
   --nccl-port 30400 --tp "$DECODE_TP" --base-gpu-id "$DECODE_BASE_GPU_ID"
@@ -94,24 +100,24 @@ wait_ready() {
 wait_ready http://127.0.0.1:30100/health
 wait_ready http://127.0.0.1:30200/health
 
-setsid python3 -m sglang_router.launch_router \
+setsid "$PYTHON_BIN" -m sglang_router.launch_router \
   --pd-disaggregation --mini-lb \
   --prefill http://127.0.0.1:30100 --decode http://127.0.0.1:30200 \
   --host 127.0.0.1 --port 30000 >"$RUN_DIR/router.log" 2>&1 &
 pids+=("$!")
 wait_ready http://127.0.0.1:30000/health
 
-python3 "$SCRIPT_DIR/run_gsm8k.py" \
+"$PYTHON_BIN" "$SCRIPT_DIR/run_gsm8k.py" \
   --base-url http://127.0.0.1:30000 --model "$MODEL_PATH" \
   --data-path "$GSM8K_DATA_PATH" --output-dir "$RUN_DIR" \
   --num-examples "$NUM_EXAMPLES" --num-threads "$NUM_THREADS" \
   --num-shots "$NUM_SHOTS" 2>&1 | tee "$RUN_DIR/gsm8k.log"
 
-python3 "$SCRIPT_DIR/assert_coverage.py" \
+"$PYTHON_BIN" "$SCRIPT_DIR/assert_coverage.py" \
   --mode "$mode" --decode-log "$RUN_DIR/decode.log" \
   --output "$RUN_DIR/coverage.json"
 
-python3 - "$RUN_DIR/gsm8k-metrics.json" "$MIN_SCORE" <<'PY'
+"$PYTHON_BIN" - "$RUN_DIR/gsm8k-metrics.json" "$MIN_SCORE" <<'PY'
 import json
 import sys
 

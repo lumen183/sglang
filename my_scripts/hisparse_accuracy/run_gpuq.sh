@@ -14,9 +14,14 @@ GPUQ_PROJECT=${GPUQ_PROJECT:-dsv4-test}
 GPUQ_TIMEOUT=${GPUQ_TIMEOUT:-2h}
 output_dir=${GPUQ_OUTPUT_DIR:-$PWD/artifacts/gpuq-$hardware-$mode-$(date +%Y%m%d-%H%M%S)}
 
+# gpuq jobs inherit the daemon's environment rather than the submitter's
+# activated conda environment. Pass the interpreter explicitly so the server
+# and evaluator use the same environment as the submitter.
+PYTHON_BIN=${PYTHON_BIN:-${CONDA_PREFIX:-/home/jovyan/whw/whw_dev}/bin/python}
+
 inner_cmd=""
 for variable in \
-  MODEL_PATH GSM8K_DATA_PATH NUM_EXAMPLES NUM_THREADS NUM_SHOTS NUM_SHOTS_EVICT \
+  PYTHON_BIN MODEL_PATH GSM8K_DATA_PATH NUM_EXAMPLES NUM_THREADS NUM_SHOTS NUM_SHOTS_EVICT \
   MIN_SCORE TOP_K DEVICE_BUFFER_SIZE HOST_TO_DEVICE_RATIO RUN_DIR; do
   if [[ -n ${!variable:-} ]]; then
     printf -v assignment 'export %s=%q && ' "$variable" "${!variable}"
