@@ -279,6 +279,7 @@ class HiSparseCoordinator:
         self.hybrid_policy = HybridHiSparsePolicy(
             total_blocks=total_c4_blocks,
             hot_cost_blocks=hot_cost_blocks,
+            reserve_ratio=hybrid_reclaim_watermark,
         )
         if self.hybrid_mode:
             self.token_to_kv_pool_allocator.set_c4_reclaim_callback(

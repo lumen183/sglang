@@ -25,6 +25,15 @@ class TestHybridHiSparsePolicy(unittest.TestCase):
         policy = HybridHiSparsePolicy(total_blocks=1000, hot_cost_blocks=4)
         self.assertEqual(policy.reclaim_target(120, 12), 12)
 
+    def test_configured_reserve_ratio_is_used(self):
+        policy = HybridHiSparsePolicy(
+            total_blocks=1000,
+            hot_cost_blocks=4,
+            reserve_ratio=0.25,
+        )
+        self.assertEqual(policy.transition_watermark, 250)
+        self.assertEqual(policy.reclaim_target(200, 12), 62)
+
 
 if __name__ == "__main__":
     unittest.main()
