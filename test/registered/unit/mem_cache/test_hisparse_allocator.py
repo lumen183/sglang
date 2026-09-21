@@ -101,6 +101,20 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
 
         self.assertFalse(allocator._ensure_c4_pages(2))
 
+    def test_default_hot_buffer_tracks_model_top_k(self):
+        from sglang.srt.mem_cache.sparsity.factory import _parse_sparse_config
+
+        publish(
+            ServerArgs(
+                model_path="dummy",
+                hisparse_config='{"hybrid_mode":true}',
+            ),
+            role="tokenizer",
+        )
+        self.assertEqual(
+            _parse_sparse_config(model_top_k=3072).device_buffer_size, 6144
+        )
+
 
 class TestDeepSeekV4HybridHiSparsePolicy(CustomTestCase):
     def test_reclaim_is_fifo_and_respects_protected_requests(self):
