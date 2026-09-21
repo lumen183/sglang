@@ -13,6 +13,7 @@ from sglang.kernels.ops.kvcache.hisparse import (
 )
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
+from sglang.srt.managers.hisparse_hybrid_policy import HybridHiSparsePolicy
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -268,13 +269,29 @@ class HiSparseCoordinator:
             max_num_req_slots, dtype=torch.bool, device=device
         )
         self._reclaim_protected_req_indices: set[int] = set()
-        self._hybrid_reclaim_watermark_tokens = int(
-            self.token_to_kv_pool_allocator.hisparse_attn_allocator.size
-            * hybrid_reclaim_watermark
+        c4_allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        total_c4_blocks = c4_allocator.size // self.page_size
+        hot_cost_blocks = (
+            self.device_buffer_size + self.page_size - 1
+        ) // self.page_size
+        # vLLM uses max(hot_cost, 10% of the shared GPU block pool).  Keep the
+        # legacy argument in the constructor for config compatibility, but do
+        # not use a token-capacity percentage for the transition decision.
+        self.hybrid_policy = HybridHiSparsePolicy(
+            total_blocks=total_c4_blocks,
+            hot_cost_blocks=hot_cost_blocks,
         )
         if self.hybrid_mode:
             self.token_to_kv_pool_allocator.set_c4_reclaim_callback(
                 self.reclaim_c4_tokens
+            )
+            logger.info(
+                "HiSparse hybrid policy: total_c4_blocks=%d hot_cost_blocks=%d "
+                "transition_watermark=%d page_size=%d",
+                self.hybrid_policy.total_blocks,
+                self.hybrid_policy.hot_cost_blocks,
+                self.hybrid_policy.transition_watermark,
+                self.page_size,
             )
 
         self._init_shared_index_prefetch(
@@ -368,6 +385,13 @@ class HiSparseCoordinator:
         req.hisparse_staging = False
         self._resident_ready_queue.append(req)
         logger.debug("HiSparse hybrid: keeping request %s C4-resident", req.rid)
+        # vLLM evaluates the transition watermark at scheduling boundaries,
+        # not only after an allocation has already failed.  The admission hook
+        # is the closest equivalent in the current SGLang coordinator.
+        allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        free_blocks = allocator.available_size() // self.page_size
+        if self.hybrid_mode and self.hybrid_policy.is_under_pressure(free_blocks):
+            self.reclaim_c4_tokens(0)
 
     def _spill_resident_request(self, req: Req) -> int:
         req_idx = req.kv.req_pool_idx
@@ -437,8 +461,20 @@ class HiSparseCoordinator:
         return freed
 
     def reclaim_c4_tokens(self, missing_tokens: int) -> int:
-        """Demote oldest resident requests until C4 allocation can proceed."""
-        target = missing_tokens + self._hybrid_reclaim_watermark_tokens
+        """Reclaim C4 pages using the vLLM block watermark policy.
+
+        The current transfer path still demotes a request as one operational
+        unit, but ``alloc_device_buffer`` releases only old C4 pages after the
+        host copy is complete.  This keeps the policy/page accounting aligned
+        with vLLM while the page table and transfer kernels remain unchanged.
+        """
+        allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        free_blocks = allocator.available_size() // self.page_size
+        missing_blocks = (missing_tokens + self.page_size - 1) // self.page_size
+        target_blocks = self.hybrid_policy.reclaim_target(
+            free_blocks, missing_blocks
+        )
+        target = target_blocks * self.page_size
         freed = 0
         candidates = list(self._resident_reqs.items())
         for req_idx, req in candidates:
