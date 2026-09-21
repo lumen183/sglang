@@ -401,7 +401,9 @@ class HiSparseCoordinator:
     def _enqueue_resident_mirror(self, req: Req) -> None:
         """Mirror a resident request's complete C4 history asynchronously."""
         req_idx = req.kv.req_pool_idx
-        allocated_len = req.kv.kv_allocated_len
+        allocated_len = (
+            getattr(req.kv, "kv_allocated_len", 0) or req.extend_range.end
+        )
         full_kv_indices = self.req_to_token_pool.req_to_token[
             req_idx, :allocated_len
         ].to(dtype=torch.int64, copy=True)
