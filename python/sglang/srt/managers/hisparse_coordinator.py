@@ -268,6 +268,12 @@ class HiSparseCoordinator:
         # mirrored asynchronously so a later pressure reclaim never has to
         # copy the whole request on the scheduler thread.
         self._resident_mirror_events: Dict[int, device_module.Event] = {}
+        # Low-frequency lifecycle markers used by operational diagnostics and
+        # the DSV4 hybrid accuracy harness.  They deliberately log only the
+        # first resident/host top-k use for a request slot, not every layer.
+        self._resident_topk_observed = False
+        self._host_topk_observed = False
+        self._mirror_completion_observed: set[int] = set()
         self._resident_mask = torch.zeros(
             max_num_req_slots, dtype=torch.bool, device=device
         )
@@ -389,7 +395,11 @@ class HiSparseCoordinator:
         req.hisparse_staging = False
         self._resident_ready_queue.append(req)
         self._enqueue_resident_mirror(req)
-        logger.debug("HiSparse hybrid: keeping request %s C4-resident", req.rid)
+        logger.info(
+            "HiSparse hybrid event=resident_admit rid=%s req_pool_idx=%d",
+            req.rid,
+            req_idx,
+        )
         # vLLM evaluates the transition watermark at scheduling boundaries,
         # not only after an allocation has already failed.  The admission hook
         # is the closest equivalent in the current SGLang coordinator.
@@ -456,6 +466,13 @@ class HiSparseCoordinator:
         mirror_event = self._resident_mirror_events.get(req_idx)
         if mirror_event is not None and not mirror_event.query():
             return 0
+        if req_idx not in self._mirror_completion_observed:
+            logger.info(
+                "HiSparse hybrid event=mirror_complete rid=%s req_pool_idx=%d",
+                req.rid,
+                req_idx,
+            )
+            self._mirror_completion_observed.add(req_idx)
 
         allocated_len = req.kv.kv_allocated_len
         full_kv_indices = self.req_to_token_pool.req_to_token[
@@ -514,9 +531,10 @@ class HiSparseCoordinator:
         after = self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
         freed = max(after - before, 0)
         logger.info(
-            "HiSparse hybrid: demoted request %s to host-backed top-k; "
-            "freed %d C4 slots",
+            "HiSparse hybrid event=demote rid=%s req_pool_idx=%d "
+            "freed_c4_slots=%d",
             req.rid,
+            req_idx,
             freed,
         )
         return freed
@@ -1243,6 +1261,7 @@ class HiSparseCoordinator:
         self.req_to_host_pool_allocated_len[req_idx] = 0
         self.lru_slots[:, req_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req_idx] = False
+        self._mirror_completion_observed.discard(req_idx)
 
     def _run_swap_in_kernel(
         self,
@@ -1352,6 +1371,13 @@ class HiSparseCoordinator:
         """
         if self.hybrid_mode:
             resident_rows = self._resident_mask[req_pool_indices]
+            if layer_id == 0:
+                if not self._resident_topk_observed and torch.any(resident_rows):
+                    logger.info("HiSparse hybrid event=resident_topk")
+                    self._resident_topk_observed = True
+                if not self._host_topk_observed and torch.any(~resident_rows):
+                    logger.info("HiSparse hybrid event=host_topk")
+                    self._host_topk_observed = True
             if torch.all(resident_rows):
                 resolved = self._resolve_resident_topk(
                     req_pool_indices, compressed_seq_lens, top_k_result
