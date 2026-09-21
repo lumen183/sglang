@@ -15,6 +15,12 @@ if [[ "$PYTHON_BIN" == */* && ! -x "$PYTHON_BIN" ]]; then
   exit 1
 fi
 
+# This host's RoCE interfaces use 100.64.0.0/10, which is also Tailscale's
+# CGNAT range. Tailscale's anti-spoof nftables rule drops local bootstrap
+# connections whose source is a 100.64.x.x address. Keep NCCL bootstrap on the
+# Tailscale interface by default; callers can override this for other hosts.
+export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-tailscale0}"
+
 MODEL_PATH=${MODEL_PATH:-/home/jovyan/whw/models/DeepSeek-V4-Flash-0731-W8A8}
 GSM8K_DATA_PATH=${GSM8K_DATA_PATH:-/home/jovyan/whw/datasets/gsm8k}
 NUM_EXAMPLES=${NUM_EXAMPLES:-200}
