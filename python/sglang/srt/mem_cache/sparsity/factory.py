@@ -59,10 +59,11 @@ def _create_backend_adaptor(
     raise ValueError(f"Unknown attention backend: {backend}")
 
 
-def _parse_sparse_config() -> SparseConfig:
+def _parse_sparse_config(model_top_k: Optional[int] = None) -> SparseConfig:
     """Parse hierarchical sparse config from JSON string.
 
-    Required fields with defaults: top_k (2048), device_buffer_size (2*top_k),
+    Required fields with defaults: top_k (2048), device_buffer_size
+    (max(2, decode_query_len) * top_k, matching vLLM for ordinary decode),
     host_to_device_ratio (2), swap_in_block_size (960).
     Optional fields (default None): algorithm, backend, min_sparse_prompt_len,
     page_size. All remaining fields go to sparse_extra_config.
@@ -78,8 +79,15 @@ def _parse_sparse_config() -> SparseConfig:
     if not isinstance(extra_config, dict):
         raise ValueError("hisparse_config must be a JSON object")
 
-    top_k = extra_config.pop("top_k", 2048)
-    device_buffer_size = extra_config.pop("device_buffer_size", 2 * top_k)
+    top_k = extra_config.pop("top_k", model_top_k or 2048)
+    configured_device_buffer_size = extra_config.pop("device_buffer_size", None)
+    # Current DSv4 hybrid support is decode-only without speculative decoding,
+    # so decode_query_len is one, matching vLLM's max(2, query_len) rule.
+    device_buffer_size = (
+        configured_device_buffer_size
+        if configured_device_buffer_size is not None
+        else max(2, 1) * top_k
+    )
     host_to_device_ratio = extra_config.pop("host_to_device_ratio", 2)
     swap_in_block_size = extra_config.pop("swap_in_block_size", 960)
     hybrid_mode = extra_config.pop("hybrid_mode", False)
@@ -132,9 +140,9 @@ def _parse_sparse_config() -> SparseConfig:
     )
 
 
-def parse_hisparse_config() -> SparseConfig:
+def parse_hisparse_config(model_top_k: Optional[int] = None) -> SparseConfig:
     """The hisparse config as resolved, with defaults where none was given."""
-    return _parse_sparse_config()
+    return _parse_sparse_config(model_top_k=model_top_k)
 
 
 def create_sparse_coordinator(
