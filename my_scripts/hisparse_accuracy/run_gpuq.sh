@@ -22,7 +22,9 @@ PYTHON_BIN=${PYTHON_BIN:-${CONDA_PREFIX:-/home/jovyan/whw/whw_dev}/bin/python}
 inner_cmd=""
 for variable in \
   PYTHON_BIN MODEL_PATH GSM8K_DATA_PATH NUM_EXAMPLES NUM_THREADS NUM_SHOTS NUM_SHOTS_EVICT \
-  MIN_SCORE TOP_K DEVICE_BUFFER_SIZE HOST_TO_DEVICE_RATIO RUN_DIR; do
+  MIN_SCORE TOP_K DEVICE_BUFFER_SIZE HOST_TO_DEVICE_RATIO RUN_DIR \
+  PREFILL_PORT DECODE_PORT ROUTER_PORT DISAGGREGATION_BOOTSTRAP_PORT \
+  PREFILL_NCCL_PORT DECODE_NCCL_PORT; do
   if [[ -n ${!variable:-} ]]; then
     printf -v assignment 'export %s=%q && ' "$variable" "${!variable}"
     inner_cmd+="$assignment"

@@ -25,6 +25,17 @@ TOP_K=${TOP_K:-512}
 DEVICE_BUFFER_SIZE=${DEVICE_BUFFER_SIZE:-4096}
 HOST_TO_DEVICE_RATIO=${HOST_TO_DEVICE_RATIO:-2}
 RUN_DIR=${RUN_DIR:-$REPO_ROOT/artifacts/hisparse_accuracy/$hardware/$mode/$(date +%Y%m%d-%H%M%S)}
+
+# Keep these overridable because fixed ports can be held by a stale job or a
+# second experiment on the same host. The PD bootstrap port is shared by the
+# prefill and decode servers; the NCCL rendezvous ports must be distinct.
+PREFILL_PORT=${PREFILL_PORT:-30100}
+DECODE_PORT=${DECODE_PORT:-30200}
+ROUTER_PORT=${ROUTER_PORT:-30000}
+DISAGGREGATION_BOOTSTRAP_PORT=${DISAGGREGATION_BOOTSTRAP_PORT:-30500}
+PREFILL_NCCL_PORT=${PREFILL_NCCL_PORT:-30300}
+DECODE_NCCL_PORT=${DECODE_NCCL_PORT:-30400}
+
 mkdir -p "$RUN_DIR"
 
 case "$mode" in
@@ -64,15 +75,19 @@ common=(
 
 prefill=(
   "$PYTHON_BIN" -m sglang.launch_server "${common[@]}"
-  --port 30100 --disaggregation-mode prefill
-  --disaggregation-bootstrap-port 30500 --disaggregation-transfer-backend nixl
-  --nccl-port 30300 --tp "$PREFILL_TP" --base-gpu-id "$PREFILL_BASE_GPU_ID"
+  --port "$PREFILL_PORT" --disaggregation-mode prefill
+  --disaggregation-bootstrap-port "$DISAGGREGATION_BOOTSTRAP_PORT"
+  --disaggregation-transfer-backend nixl
+  --nccl-port "$PREFILL_NCCL_PORT" --tp "$PREFILL_TP"
+  --base-gpu-id "$PREFILL_BASE_GPU_ID"
 )
 decode=(
   "$PYTHON_BIN" -m sglang.launch_server "${common[@]}"
-  --port 30200 --disaggregation-mode decode
-  --disaggregation-bootstrap-port 30500 --disaggregation-transfer-backend nixl
-  --nccl-port 30400 --tp "$DECODE_TP" --base-gpu-id "$DECODE_BASE_GPU_ID"
+  --port "$DECODE_PORT" --disaggregation-mode decode
+  --disaggregation-bootstrap-port "$DISAGGREGATION_BOOTSTRAP_PORT"
+  --disaggregation-transfer-backend nixl
+  --nccl-port "$DECODE_NCCL_PORT" --tp "$DECODE_TP"
+  --base-gpu-id "$DECODE_BASE_GPU_ID"
 )
 if [[ "$mode" != baseline ]]; then
   decode+=(--enable-hisparse --hisparse-config "$HISPARSE_CONFIG")
@@ -97,18 +112,19 @@ pids+=("$!")
 wait_ready() {
   until curl -sf "$1" >/dev/null; do sleep 2; done
 }
-wait_ready http://127.0.0.1:30100/health
-wait_ready http://127.0.0.1:30200/health
+wait_ready "http://127.0.0.1:$PREFILL_PORT/health"
+wait_ready "http://127.0.0.1:$DECODE_PORT/health"
 
 setsid "$PYTHON_BIN" -m sglang_router.launch_router \
   --pd-disaggregation --mini-lb \
-  --prefill http://127.0.0.1:30100 --decode http://127.0.0.1:30200 \
-  --host 127.0.0.1 --port 30000 >"$RUN_DIR/router.log" 2>&1 &
+  --prefill "http://127.0.0.1:$PREFILL_PORT" \
+  --decode "http://127.0.0.1:$DECODE_PORT" \
+  --host 127.0.0.1 --port "$ROUTER_PORT" >"$RUN_DIR/router.log" 2>&1 &
 pids+=("$!")
-wait_ready http://127.0.0.1:30000/health
+wait_ready "http://127.0.0.1:$ROUTER_PORT/health"
 
 "$PYTHON_BIN" "$SCRIPT_DIR/run_gsm8k.py" \
-  --base-url http://127.0.0.1:30000 --model "$MODEL_PATH" \
+  --base-url "http://127.0.0.1:$ROUTER_PORT" --model "$MODEL_PATH" \
   --data-path "$GSM8K_DATA_PATH" --output-dir "$RUN_DIR" \
   --num-examples "$NUM_EXAMPLES" --num-threads "$NUM_THREADS" \
   --num-shots "$NUM_SHOTS" 2>&1 | tee "$RUN_DIR/gsm8k.log"
