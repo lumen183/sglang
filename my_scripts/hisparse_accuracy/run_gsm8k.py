@@ -21,11 +21,9 @@ def main() -> None:
     parser.add_argument("--num-shots", type=int, default=20)
     args = parser.parse_args()
 
-    dataset = (
-        args.data_path
-        if args.data_path.is_file()
-        else args.data_path / "test.jsonl"
-    )
+    # The evaluator accepts a JSONL file, a Parquet file, or a dataset
+    # directory containing test.jsonl/Parquet shards.
+    dataset = args.data_path
     eval_args = SimpleNamespace(
         base_url=args.base_url.rstrip("/"),
         host=None,

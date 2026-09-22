@@ -104,6 +104,13 @@ if [[ "$mode" == hybrid-* ]]; then
   decode+=(--cuda-graph-backend-decode disabled)
 fi
 
+# gpuq's systemd service defaults to LimitMEMLOCK=8MiB. gpuq-runner has
+# passwordless sudo, so raise this job's limit before starting the services;
+# the child processes created below inherit the unlimited memlock limit.
+if ! sudo -n prlimit --pid $$ --memlock=unlimited:unlimited 2>/dev/null; then
+  echo "warning: failed to raise RLIMIT_MEMLOCK; mooncake RDMA registration may fail" >&2
+fi
+
 pids=()
 watchdog_pid=""
 cleanup() {
