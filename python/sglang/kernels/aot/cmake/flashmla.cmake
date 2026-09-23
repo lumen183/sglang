@@ -2,7 +2,7 @@
 # DeepSeek v4.1 kernels merged into the SGLang fork (sgl-project/FlashMLA@3e18517).
 FetchContent_Declare(
     repo-flashmla
-    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/3e18517fb055a6c9608eef5a1f1347fb1a047bbd.tar.gz
+    URL      ${GITHUB_BASE_URL}/sgl-project/FlashMLA/archive/3e18517fb055a6c9608eef5a1f1347fb1a047bbd.tar.gz
     URL_HASH SHA256=ab2af4657683a1bbaa707a2781a5e2c2792eba574ff36905f1832598e67fea79
 )
 FetchContent_Populate(repo-flashmla)
@@ -10,7 +10,7 @@ FetchContent_Populate(repo-flashmla)
 # flashmla submodule pin: NVIDIA/cutlass @ 147f5673d0c1c3dcf66f78d677fd647e4a020219
 FetchContent_Declare(
     repo-flashmla-cutlass
-    URL      https://${GITHUB_ARTIFACTORY}/NVIDIA/cutlass/archive/147f5673d0c1c3dcf66f78d677fd647e4a020219.tar.gz
+    URL      ${GITHUB_BASE_URL}/NVIDIA/cutlass/archive/147f5673d0c1c3dcf66f78d677fd647e4a020219.tar.gz
     URL_HASH SHA256=9f6c53320a85b4a570975e557918cde65168cd311f081920446c238437347dc6
     SOURCE_DIR ${repo-flashmla_SOURCE_DIR}/csrc/cutlass
 )

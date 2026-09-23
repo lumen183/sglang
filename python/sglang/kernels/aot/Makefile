@@ -13,7 +13,7 @@ CMAKE_POLICY_VERSION_MINIMUM ?= 3.5
 
 # Optional GitHub mirror for FetchContent (e.g. internal artifactory).
 # Empty -> CMakeLists.txt default (github.com).
-GITHUB_ARTIFACTORY ?=
+GITHUB_ARTIFACTORY ?= http://mirrors.sangfor.org/nexus/repository/github
 ifneq ($(strip $(GITHUB_ARTIFACTORY)),)
 CMAKE_ARGS += -DGITHUB_ARTIFACTORY=$(GITHUB_ARTIFACTORY)
 endif
